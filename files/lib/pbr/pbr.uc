@@ -131,6 +131,7 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 		output.okn();
 	};
 	forwarding.enable = function() {
+		load_config();
 		if (forwarding._read() != '1') {
 			sh.run('/sbin/sysctl -w net.ipv4.ip_forward=1');
 			sh.run('/sbin/sysctl -w net.ipv6.conf.all.forwarding=1');
@@ -428,8 +429,13 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 			let param4 = '', param6 = '';
 			let inline_set_ipv4_empty = false, inline_set_ipv6_empty = false;
 	
-			let dest4 = 'dport 53 dnat ip to ' + dest_dns_ipv4 + ':' + dest_dns_port;
-			let dest6 = 'dport 53 dnat ip6 to ' + dest_dns_ipv6 + ':' + dest_dns_port;
+			let dest4 = 'dport 53 dnat ip to ' + dest_dns_ipv4 + (dest_dns_port ? ':' + dest_dns_port : '');
+			// nft requires the IPv6 address to be bracketed when a port follows it.
+			// is_ipv6() only checks for a ':', so dest_dns_ipv6 may already carry
+			// brackets from the config; strip them first to avoid doubling up.
+			let bare_dest_dns_ipv6 = dest_dns_ipv6 ? replace(dest_dns_ipv6, /^\[|\]$/g, '') : dest_dns_ipv6;
+			let dest6 = 'dport 53 dnat ip6 to ' +
+				(dest_dns_port ? '[' + bare_dest_dns_ipv6 + ']:' + dest_dns_port : bare_dest_dns_ipv6);
 	
 			if (src_addr) {
 				let r = nft.classify_addr(src_addr, 'src', null, null, null, false);
@@ -739,6 +745,41 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 			output.fail(); return 1;
 		}
 		interface_name = net.normalize_policy_target(interface_name);
+		if (net.is_tor(interface_name)) {
+			// Tor is a dstnat redirect, not a routed interface: the rules below
+			// hardcode ports 53/80/443 and force the dstnat chain, so these
+			// options are silently discarded (src_port additionally produces an
+			// invalid rule). Warn rather than reject -- a dest_addr holding
+			// ordinary resolvable domains is a legitimate Tor policy.
+			//
+			// History: these warnings were live from f532ad3 (2022-12-14) until
+			// d2aba93 (2024-02-16) 'better TOR support in nft', which deleted the
+			// dedicated policy_routing_tor_nft()/_iptables() helpers and folded
+			// Tor into policy_routing(). The call sites went with those helpers
+			// and were never re-added -- confirmed with the maintainer that this
+			// was unintentional rather than a deliberate removal. The catalog
+			// strings were left behind in pkg.uc and status.js, unreachable ever
+			// since. Deliberately not restored verbatim: the old
+			// warningTorUnsetParams also told users to unset src_addr, which that
+			// same refactor turned into the correct way to match a Tor policy, so
+			// its wording is now split per option.
+			//
+			// Deliberately NOT warned about: dest_addr, including '.onion'. A
+			// domain dest_addr is a supported Tor policy and works whenever DNS
+			// for the domain reaches Tor. pbr cannot see whether it does -- that
+			// depends on dnsmasq, which on OpenWrt declares '.onion' local via
+			// /usr/share/dnsmasq/rfc6761.conf -- so any such warning would fire
+			// just as loudly on a correct setup as on a broken one. Documented
+			// instead; see the Tor section of the README.
+			if (src_port)
+				push(state.warnings, { code: 'warningTorUnsetSrcPort', info: name });
+			if (dest_port)
+				push(state.warnings, { code: 'warningTorUnsetDestPort', info: name });
+			if (proto)
+				push(state.warnings, { code: 'warningTorUnsetProto', info: name });
+			if (chain && lc(chain) != 'prerouting')
+				push(state.warnings, { code: 'warningTorUnsetChainNft', info: name });
+		}
 		if (!net.is_supported_policy_target(interface_name)) {
 			if (net.is_mwan4_interface(interface_name))
 				push(state.errors, { code: 'errorPolicyMwan4InterfaceTarget', info: interface_name });
@@ -865,13 +906,13 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 			if (gw4 || cfg.strict_enforcement) {
 				if (gw4)
 					ipv4_error = sh.try_cmd(state.errors, pkg.ip_full, '-4', 'route', 'replace', 'default', 'via', gw4, 'dev', dev4, 'table', tid) ? 0 : 1;
-				else if (index(sh.exec(pkg.ip_full + ' address show dev ' + sh.quote(dev4)), 'POINTOPOINT') >= 0)
+				else if (net.is_p2p(dev4))
 					ipv4_error = sh.try_cmd(state.errors, pkg.ip_full, '-4', 'route', 'replace', 'default', 'dev', dev4, 'table', tid) ? 0 : 1;
 				else
 					ipv4_error = sh.try_cmd(state.errors, pkg.ip_full, '-4', 'route', 'replace', 'unreachable', 'default', 'table', tid) ? 0 : 1;
 				if (sh.try_ip(state.errors, '-4', 'rule', 'replace', 'fwmark', mark + '/' + cfg.fw_mask, 'table', tid, 'priority', priority) != true)
 					ipv4_error = 1;
-			} else if (index(sh.exec(pkg.ip_full + ' address show dev ' + sh.quote(dev4)), 'POINTOPOINT') >= 0) {
+			} else if (net.is_p2p(dev4)) {
 				ipv4_error = sh.try_cmd(state.errors, pkg.ip_full, '-4', 'route', 'replace', 'default', 'dev', dev4, 'table', tid) ? 0 : 1;
 				if (sh.try_ip(state.errors, '-4', 'rule', 'replace', 'fwmark', mark + '/' + cfg.fw_mask, 'table', tid, 'priority', priority) != true)
 					ipv4_error = 1;
@@ -892,13 +933,13 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 			if (gw6 || cfg.strict_enforcement) {
 				if (gw6)
 					ipv6_error = sh.try_cmd(state.errors, pkg.ip_full, '-6', 'route', 'replace', 'default', 'via', gw6, 'dev', dev6, 'table', tid, 'metric', cfg.uplink_interface6_metric) ? 0 : 1;
-				else if (index(sh.exec(pkg.ip_full + ' address show dev ' + sh.quote(dev6)), 'POINTOPOINT') >= 0)
+				else if (net.is_p2p(dev6))
 					ipv6_error = sh.try_cmd(state.errors, pkg.ip_full, '-6', 'route', 'replace', 'default', 'dev', dev6, 'table', tid, 'metric', cfg.uplink_interface6_metric) ? 0 : 1;
 				else
 					ipv6_error = sh.try_cmd(state.errors, pkg.ip_full, '-6', 'route', 'replace', 'unreachable', 'default', 'table', tid) ? 0 : 1;
 				if (sh.try_ip(state.errors, '-6', 'rule', 'replace', 'fwmark', mark + '/' + cfg.fw_mask, 'table', tid, 'priority', priority) != true)
 					ipv6_error = 1;
-			} else if (index(sh.exec(pkg.ip_full + ' address show dev ' + sh.quote(dev6)), 'POINTOPOINT') >= 0) {
+			} else if (net.is_p2p(dev6)) {
 				ipv6_error = sh.try_cmd(state.errors, pkg.ip_full, '-6', 'route', 'replace', 'default', 'dev', dev6, 'table', tid, 'metric', cfg.uplink_interface6_metric) ? 0 : 1;
 				if (sh.try_ip(state.errors, '-6', 'rule', 'replace', 'fwmark', mark + '/' + cfg.fw_mask, 'table', tid, 'priority', priority) != true)
 					ipv6_error = 1;
@@ -972,13 +1013,13 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 			if (gw4 || cfg.strict_enforcement) {
 				if (gw4)
 					ipv4_error = sh.try_cmd(state.errors, pkg.ip_full, '-4', 'route', 'replace', 'default', 'via', gw4, 'dev', dev4, 'table', tid) ? 0 : 1;
-				else if (index(sh.exec(pkg.ip_full + ' address show dev ' + sh.quote(dev4)), 'POINTOPOINT') >= 0)
+				else if (net.is_p2p(dev4))
 					ipv4_error = sh.try_cmd(state.errors, pkg.ip_full, '-4', 'route', 'replace', 'default', 'dev', dev4, 'table', tid) ? 0 : 1;
 				else
 					ipv4_error = sh.try_cmd(state.errors, pkg.ip_full, '-4', 'route', 'replace', 'unreachable', 'default', 'table', tid) ? 0 : 1;
 				if (sh.try_ip(state.errors, '-4', 'rule', 'replace', 'fwmark', mark + '/' + cfg.fw_mask, 'table', tid, 'priority', priority) != true)
 					ipv4_error = 1;
-			} else if (index(sh.exec(pkg.ip_full + ' address show dev ' + sh.quote(dev4)), 'POINTOPOINT') >= 0) {
+			} else if (net.is_p2p(dev4)) {
 				ipv4_error = sh.try_cmd(state.errors, pkg.ip_full, '-4', 'route', 'replace', 'default', 'dev', dev4, 'table', tid) ? 0 : 1;
 				if (sh.try_ip(state.errors, '-4', 'rule', 'replace', 'fwmark', mark + '/' + cfg.fw_mask, 'table', tid, 'priority', priority) != true)
 					ipv4_error = 1;
@@ -998,13 +1039,13 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 			if (gw6 || cfg.strict_enforcement) {
 				if (gw6)
 					ipv6_error = sh.try_cmd(state.errors, pkg.ip_full, '-6', 'route', 'replace', 'default', 'via', gw6, 'dev', dev6, 'table', tid, 'metric', cfg.uplink_interface6_metric) ? 0 : 1;
-				else if (index(sh.exec(pkg.ip_full + ' address show dev ' + sh.quote(dev6)), 'POINTOPOINT') >= 0)
+				else if (net.is_p2p(dev6))
 					ipv6_error = sh.try_cmd(state.errors, pkg.ip_full, '-6', 'route', 'replace', 'default', 'dev', dev6, 'table', tid, 'metric', cfg.uplink_interface6_metric) ? 0 : 1;
 				else
 					ipv6_error = sh.try_cmd(state.errors, pkg.ip_full, '-6', 'route', 'replace', 'unreachable', 'default', 'table', tid) ? 0 : 1;
 				if (sh.try_ip(state.errors, '-6', 'rule', 'replace', 'fwmark', mark + '/' + cfg.fw_mask, 'table', tid, 'priority', priority) != true)
 					ipv6_error = 1;
-			} else if (index(sh.exec(pkg.ip_full + ' address show dev ' + sh.quote(dev6)), 'POINTOPOINT') >= 0) {
+			} else if (net.is_p2p(dev6)) {
 				ipv6_error = sh.try_cmd(state.errors, pkg.ip_full, '-6', 'route', 'replace', 'default', 'dev', dev6, 'table', tid, 'metric', cfg.uplink_interface6_metric) ? 0 : 1;
 				if (sh.try_ip(state.errors, '-6', 'rule', 'replace', 'fwmark', mark + '/' + cfg.fw_mask, 'table', tid, 'priority', priority) != true)
 					ipv6_error = 1;
@@ -1041,14 +1082,14 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 				push(state.errors, { code: 'errorInterfaceMarkOverflow', info: iface });
 				return;
 			}
-	
-			let dev4;
-			if (net.is_ovpn(iface)) {
-				dev4 = net.uci_get_device(iface);
-			} else {
-				dev4 = net.network_get_device(iface);
-				if (!dev4) dev4 = net.network_get_physdev(iface);
+			if (+_iface_priority <= 0) {
+				push(state.errors, { code: 'errorInterfacePriorityExhausted', info: iface });
+				return;
 			}
+	
+			let dev4 = net.network_get_device(iface);
+			if (!dev4) dev4 = net.network_get_physdev(iface);
+			if (!dev4) dev4 = net.uci_get_device(iface);
 			let dev6 = null;
 			if (net.is_uplink4(iface) && cfg.uplink_interface6) {
 				dev6 = net.network_get_device(cfg.uplink_interface6);
@@ -1157,6 +1198,7 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 
 	interface_process.create_global_rules = function() {
 		let prio = '' + iface_priority;
+		let priority_exhausted = false;
 		config.uci_ctx('network').foreach('network', 'interface', function(s_iface) {
 			let name = s_iface['.name'];
 			if (net.is_wg_server(name) && !net.is_ignored_interface(name)) {
@@ -1164,6 +1206,13 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 				let listen_port = config.uci_ctx('network').get('network', name, 'listen_port');
 				if (disabled != '1' && listen_port) {
 					if (cfg.uplink_interface4) {
+						if (+prio <= 0) {
+							if (!priority_exhausted) {
+								push(state.errors, { code: 'errorInterfacePriorityExhausted', info: name });
+								priority_exhausted = true;
+							}
+							return;
+						}
 						let tbl = pkg.ip_table_prefix + '_' + cfg.uplink_interface4;
 						system(pkg.ip_full + ' -4 rule del sport ' + listen_port + ' table ' + tbl + ' priority ' + prio + ' 2>/dev/null');
 						sh.ip('-4', 'rule', 'add', 'sport', listen_port, 'table', tbl, 'priority', prio);
@@ -1176,6 +1225,17 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 				}
 			}
 		});
+		// prio may have been left at <= 0 by the exhaustion guard above: never
+		// issue an 'ip rule' at priority 0, it collides with the kernel's own
+		// 'from all lookup local' rule (see 12b993766718). Bail out the same
+		// way the tail of this function does: iface_priority stays a string,
+		// and the returned 0 is unused, the sole caller ignores it.
+		if (+prio <= 0) {
+			if (!priority_exhausted)
+				push(state.errors, { code: 'errorInterfacePriorityExhausted', info: pkg.name });
+			iface_priority = prio;
+			return 0;
+		}
 		system(pkg.ip_full + ' -4 rule del priority ' + prio + ' 2>/dev/null');
 		system(pkg.ip_full + ' -4 rule del lookup main suppress_prefixlength ' + cfg.prefixlength + ' 2>/dev/null');
 		sh.try_cmd(state.errors, pkg.ip_full, '-4', 'rule', 'add', 'lookup', 'main', 'suppress_prefixlength',
@@ -1208,13 +1268,12 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 		return 0;
 	};
 
-	// Build the "GW4[/GW6]" display suffix. IPv4 always renders (falling back
-	// to 0.0.0.0); the IPv6 segment is omitted entirely when the interface has
-	// no v6 gateway or address, so v6-less interfaces don't render a bare "/-".
+	// Build the "GW4[/GW6]" display suffix. IPv4 falls back to 0.0.0.0,
+	// IPv6 to ::0 ; the IPv6 segment is omitted when IPv6 is disabled
 	function disp_gw_suffix(dg4, dg6) {
 		let s = dg4 || '0.0.0.0';
-		if (cfg.ipv6_enabled && dg6 && dg6 != '')
-			s += '/' + dg6;
+		if (cfg.ipv6_enabled)
+			s += '/' + (dg6 || '::0');
 		return s;
 	}
 
@@ -1227,8 +1286,8 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 		let dev6 = existing.device_ipv6;
 
 		let _tid = interface_resolve_tid(iface);
-		let gw4 = net.get_gateway4(iface, dev4, state.errors);
-		let gw6 = net.get_gateway6(iface, dev6, state.errors);
+		let gw4 = net.get_gateway4(iface, dev4, state.warnings);
+		let gw6 = net.get_gateway6(iface, dev6, state.warnings);
 		// Fall back to the interface's own address for display when there is
 		// no gateway (e.g. point-to-point links). Computed before split-uplink
 		// clearing so the display reflects the interface's real addresses.
@@ -1318,8 +1377,8 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 		let dev4 = existing.device_ipv4;
 		let dev6 = existing.device_ipv6;
 		let _tid = interface_resolve_tid(iface);
-		let gw4 = net.get_gateway4(iface, dev4, state.errors);
-		let gw6 = net.get_gateway6(iface, dev6, state.errors);
+		let gw4 = net.get_gateway4(iface, dev4, state.warnings);
+		let gw6 = net.get_gateway6(iface, dev6, state.warnings);
 		let ipa4 = net.get_ipaddr4(iface, dev4);
 		let ipa6 = net.get_ipaddr6(iface, dev6);
 		let dg4 = gw4 || ipa4 || '';
@@ -1353,8 +1412,8 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 		let dev4 = existing.device_ipv4;
 		let dev6 = existing.device_ipv6;
 		let _tid = interface_resolve_tid(iface);
-		let gw4 = net.get_gateway4(iface, dev4, state.errors);
-		let gw6 = net.get_gateway6(iface, dev6, state.errors);
+		let gw4 = net.get_gateway4(iface, dev4, state.warnings);
+		let gw6 = net.get_gateway6(iface, dev6, state.warnings);
 		let ipa4 = net.get_ipaddr4(iface, dev4);
 		let ipa6 = net.get_ipaddr6(iface, dev6);
 		let dg4 = gw4 || ipa4 || '';
@@ -1825,6 +1884,7 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 			// value is process-local, so this is effectively a no-op here, kept
 			// for parity with the reference implementation.
 			nft.resolver.store_hash();
+			output.verbose.write("Skipping reload for '" + iface + "' - IPv6 gateway unchanged (" + cur + ")\\n");
 			return true;
 		}
 		return false;
@@ -1899,9 +1959,6 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 		let ubus_errors = config.ubus_call('service', 'list', { name: pkg.name });
 		let svc_data = ubus_errors?.[pkg.name]?.data;
 		if (svc_data?.errors && length(svc_data.errors) > 0) {
-			service_start_trigger = 'on_start';
-			reloaded_iface = null;
-		} else if (svc_data?.warnings && length(svc_data.warnings) > 0) {
 			service_start_trigger = 'on_start';
 			reloaded_iface = null;
 		} else if (!nft.is_service_running_nft()) {
@@ -2104,12 +2161,14 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 	
 	// ── service_started ─────────────────────────────────────────────────
 	
-	function service_started(param) {
+	function service_started(param, deferred_to_boot) {
 		if (param == 'on_boot') return;
 		// Uplink was down at start time; we've already emitted the warning
 		// and are waiting for the procd boot trigger to retry. This is a
 		// designed deferral, not a startup failure.
-		if (_deferred_to_boot) return;
+		if (deferred_to_boot == '1' || _deferred_to_boot) {
+			return;
+		}
 
 		load_platform();
 
@@ -2402,18 +2461,22 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 			for (let line in split('' + content, '\n')) {
 				let m = match(line, /^(\s*(option|list)\s+)(endpoint_host|key|password|preshared_key|private_key|psk|public_key|token|username)(\s+)(.*)/);
 				if (m) {
-					let masked = replace(m[5], /[^ \t.\x27]/g, '*');
+					let masked = replace(m[5], /[^ \t\x27"]+/g, 'REDACTED');
 					printf('%s%s%s%s\n', m[1], m[3], m[4], masked);
 				} else {
 					let masked_line = line;
 					if (!match(line, /^\s*(option|list)\s+allowed_ips\s+/)) {
+						// MAC addresses (exactly six colon-separated octets)
+						masked_line = replace(masked_line, /\b([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}\b/g, '__:RE:DA:CT:ED:__');
+						// IPv6 addresses (full and :: compressed forms)
+						masked_line = replace(masked_line, /(([0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}|([0-9A-Fa-f]{1,4}:){1,7}:|([0-9A-Fa-f]{1,4}:){1,6}:[0-9A-Fa-f]{1,4}|([0-9A-Fa-f]{1,4}:){1,5}(:[0-9A-Fa-f]{1,4}){1,2}|([0-9A-Fa-f]{1,4}:){1,4}(:[0-9A-Fa-f]{1,4}){1,3}|([0-9A-Fa-f]{1,4}:){1,3}(:[0-9A-Fa-f]{1,4}){1,4}|([0-9A-Fa-f]{1,4}:){1,2}(:[0-9A-Fa-f]{1,4}){1,5}|[0-9A-Fa-f]{1,4}:(:[0-9A-Fa-f]{1,4}){1,6}|:((:[0-9A-Fa-f]{1,4}){1,7}|:))/g, 'RE:DA::CT:ED');
+						// Public IPv4 addresses (private ranges left intact)
 						masked_line = replace(masked_line, /([0-9]{1,3}\.){3}[0-9]{1,3}/g, function(ip) {
 							if (match(ip, /^(10\.|127\.|192\.168\.)/) ||
 							    match(ip, /^172\.(1[6-9]|2[0-9]|3[01])\./))
 								return ip;
-							return replace(ip, /[0-9]/g, '*');
+							return 'RE.DA.CT.ED';
 						});
-						masked_line = replace(masked_line, /([a-fA-F0-9]{2,}:){1,7}[a-fA-F0-9]{2,}/g, '***');
 					}
 					printf('%s\n', masked_line);
 				}
@@ -2452,7 +2515,6 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 		result[name] = {
 			enabled: !!cfg.enabled,
 			running: platform.is_running_nft_file(),
-			running_iptables: false,
 			running_nft: nft.is_service_running_nft(),
 			running_nft_file: platform.is_running_nft_file(),
 			version: pkg.version,

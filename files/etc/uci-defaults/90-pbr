@@ -19,7 +19,6 @@ sed -i "s/'PREROUTING'/'prerouting'/g" /etc/config/pbr
 sed -i "s/'POSTROUTING'/'postrouting'/g" /etc/config/pbr
 sed -i "s/option fw_mask '0x\(.*\)'/option fw_mask '\1'/g" /etc/config/pbr
 sed -i "s/option wan_mark '0x\(.*\)'/option wan_mark '\1'/g" /etc/config/pbr
-sed -i "s|option path '/etc/pbr/|option path '/usr/share/pbr/|g" /etc/config/pbr
 sed -i "/procd_lan_interface/d" /etc/config/pbr
 sed -i "s|procd_lan_device|lan_device|g" /etc/config/pbr
 sed -i "s|procd_wan_interface|uplink_interface|g" /etc/config/pbr
@@ -46,6 +45,11 @@ uci -q delete pbr.config.webui_show_ignore_target
 [ -n "$(uci changes pbr)" ] && uci_commit pbr
 
 # ── Part 2: NFT resolver setup ───────────────────────────────────────
+
+check_dnsmasq_nftset() {
+	[ -z "$dnsmasq_features" ] && dnsmasq_features="$(dnsmasq --version | grep -m1 'Compile time options:' | cut -d: -f2) "
+	[ "${dnsmasq_features#* nftset }" != "$dnsmasq_features" ]
+}
 
 if [ "$(uci_get 'pbr' 'config' 'resolver_set')" != 'dnsmasq.nftset' ]; then
 	if check_dnsmasq_nftset; then

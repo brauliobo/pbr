@@ -275,7 +275,7 @@ run_test() {
 n_tests=0
 n_fails=0
 
-select_tests="$@"
+select_tests=("$@")
 has_ucode=1
 
 if ! command -v ucode >/dev/null 2>&1; then
@@ -288,9 +288,9 @@ use_test() {
 	local test
 
 	[ -f "$input" ] || return 1
-	[ -n "$select_tests" ] || return 0
+	[ ${#select_tests[@]} -gt 0 ] || return 0
 
-	for test in "$select_tests"; do
+	for test in "${select_tests[@]}"; do
 		test="$(readlink -f "$test")"
 
 		[ "$test" != "$input" ] || return 0
@@ -299,20 +299,34 @@ use_test() {
 	return 1
 }
 
-if [ "$has_ucode" -eq 1 ]; then
-	for catdir in tests/[0-9][0-9]_*; do
-		[ -d "$catdir" ] || continue
 
-		printf "\n##\n## Running %s tests\n##\n\n" "${catdir##*/[0-9][0-9]_}"
+for catdir in tests/[0-9][0-9]_*; do
+	[ -d "$catdir" ] || continue
 
-		for testfile in "$catdir/"[0-9][0-9]_*; do
-			use_test "$testfile" || continue
+	printf "\n##\n## Running %s tests\n##\n\n" "${catdir##*/[0-9][0-9]_}"
 
+	for testfile in "$catdir/"[0-9][0-9]_*; do
+		use_test "$testfile" || continue
+
+		if [ "${testfile##*.}" = "sh" ]; then
 			n_tests=$((n_tests + 1))
-			run_test "$testfile" || n_fails=$((n_fails + 1))
-		done
+			name=${testfile##*/}
+			printf "%s %s " "$name" "${line:${#name}}"
+			if bash "$testfile" >/dev/null 2>&1; then
+				printf "OK\n"
+			else
+				printf "FAILED\n"
+				bash "$testfile" # run again to show output
+				n_fails=$((n_fails + 1))
+			fi
+			continue
+		fi
+
+		[ "$has_ucode" -eq 1 ] || continue
+		n_tests=$((n_tests + 1))
+		run_test "$testfile" || n_fails=$((n_fails + 1))
 	done
-fi
+done
 
 # ── Shell script syntax checks ──────────────────────────────────────
 

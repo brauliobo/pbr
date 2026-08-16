@@ -5,9 +5,9 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=pbr
 PKG_VERSION:=1.2.3
-PKG_RELEASE:=72
+PKG_RELEASE:=85
 PKG_LICENSE:=AGPL-3.0-or-later
-PKG_MAINTAINER:=Stan Grishin <stangri@melmac.ca>
+PKG_MAINTAINER:=Stan Grishin <stangri@melmac.ca>, Erik Conijn <egc112@msn.com>
 
 include $(INCLUDE_DIR)/package.mk
 
