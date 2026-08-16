@@ -1,0 +1,245 @@
+Testing that pbr accepts valid mwan4_strategy_<name> targets,
+rejects unknown strategies and direct mwan4-managed interface targets,
+and emits warnings when pbr/mwan4 marks, masks, tables or priorities overlap.
+
+-- File fs/access~_etc_init_d_mwan4~x.txt --
+true
+-- End --
+
+-- File fs/stat~_etc_config_mwan4.json --
+{"type":"file"}
+-- End --
+
+-- File fs/open~_etc_iproute2_rt_tables.txt --
+1 mwan4_wan
+1 pbr_wan
+2 mwan4_wan6
+2 pbr_wan6
+128 prelocal
+255 local
+254 main
+253 default
+0 unspec
+-- End --
+
+-- File mwan4/config.json --
+{
+	"interfaces": ["wan", "wan6"],
+	"marks": {
+		"wan":  "0x00000100/0x00000f00",
+		"wan6": "0x00000200/0x00000f00"
+	},
+	"interface_chains": {
+		"wan":  "mwan4_iface_in_wan",
+		"wan6": "mwan4_iface_in_wan6"
+	},
+	"strategies": ["balanced"],
+	"strategy_chains": {
+		"balanced": "mwan4_strategy_balanced"
+	}
+}
+-- End --
+
+-- File uci/network.json --
+{
+	"interface": [
+		{
+			".name": "loopback",
+			"device": "lo",
+			"proto": "static",
+			"ipaddr": "127.0.0.1",
+			"netmask": "255.0.0.0"
+		},
+		{
+			".name": "lan",
+			"device": "br-lan",
+			"proto": "static",
+			"ipaddr": "192.168.1.1/24"
+		},
+		{
+			".name": "wan",
+			"device": "eth1",
+			"proto": "dhcp"
+		},
+		{
+			".name": "wan6",
+			"device": "eth1",
+			"proto": "dhcpv6"
+		},
+		{
+			".name": "vpn",
+			"device": "tun0",
+			"proto": "openvpn"
+		}
+	]
+}
+-- End --
+
+-- File fs/popen~_usr_libexec_ip-full_-4_rule_list_2_dev_null.txt --
+29998: from all fwmark 0x00000100/0x00003f00 lookup mwan4_wan
+-- End --
+
+-- File uci/pbr.json --
+{
+	"pbr": [
+		{
+			".name": "config",
+			"enabled": "1",
+			"fw_mask": "00000f00",
+			"ipv6_enabled": "1",
+			"nft_rule_counter": "0",
+			"nft_set_auto_merge": "1",
+			"nft_set_counter": "0",
+			"nft_set_flags_interval": "1",
+			"nft_set_flags_timeout": "0",
+			"nft_set_policy": "performance",
+			"debug_performance": "0",
+			"nft_user_set_counter": "0",
+			"procd_boot_trigger_delay": "5000",
+			"procd_reload_delay": "0",
+			"resolver_set": "dnsmasq.nftset",
+			"strict_enforcement": "1",
+			"uplink_interface": "wan",
+			"uplink_interface6": "wan6",
+			"uplink_ip_rules_priority": "30000",
+			"uplink_mark": "00000100",
+			"verbosity": "2",
+			"ignored_interface": [],
+			"lan_device": ["br-lan"],
+			"resolver_instance": ["*"]
+		}
+	],
+	"policy": [
+		{
+			".name": "policy_direct_mwan4_iface",
+			"name": "Unsafe direct mwan4 interface",
+			"enabled": "1",
+			"interface": "wan",
+			"src_addr": "192.168.7.0/24",
+			"dest_addr": "",
+			"src_port": "",
+			"dest_port": "",
+			"proto": "",
+			"chain": "prerouting"
+		},
+		{
+			".name": "policy_strategy_mwan4",
+			"name": "Safe mwan4 strategy",
+			"enabled": "1",
+			"interface": "mwan4_strategy_balanced",
+			"src_addr": "192.168.8.0/24",
+			"dest_addr": "",
+			"src_port": "",
+			"dest_port": "",
+			"proto": "",
+			"chain": "prerouting"
+		},
+		{
+			".name": "policy_unknown_mwan4_strategy",
+			"name": "Unknown mwan4 strategy",
+			"enabled": "1",
+			"interface": "mwan4_strategy_missing",
+			"src_addr": "192.168.9.0/24",
+			"dest_addr": "",
+			"src_port": "",
+			"dest_port": "",
+			"proto": "",
+			"chain": "prerouting"
+		},
+		{
+			".name": "policy_direct_mwan4_label",
+			"name": "Unsafe direct mwan4 label",
+			"enabled": "1",
+			"interface": "mwan4:wan",
+			"src_addr": "192.168.10.0/24",
+			"dest_addr": "",
+			"src_port": "",
+			"dest_port": "",
+			"proto": "",
+			"chain": "prerouting"
+		}
+	],
+	"dns_policy": [],
+	"include": []
+}
+-- End --
+
+-- Testcase --
+import create_pbr from 'pbr';
+let pbr = create_pbr();
+
+let result = pbr.start_service(['on_start']);
+let nft_content = global.mocklib.read_captured('/var/run/pbr.nft') || '';
+let errors = result?.errors || [];
+let warnings = result?.warnings || [];
+let lines = split(nft_content, '\n');
+let interfaces = result?.interfaces || [];
+let labels = result?.interface_labels || {};
+let uplink_interfaces = result?.uplink_interfaces || [];
+
+let direct_errors = filter(errors,
+	e => e.code == 'errorPolicyMwan4InterfaceTarget' && index(e.info || '', 'wan') >= 0);
+let unknown_strategy_errors = filter(errors,
+	e => e.code == 'errorPolicyUnknownInterface' && index(e.info || '', 'Unknown mwan4 strategy') >= 0);
+let collision_warnings = filter(warnings,
+	w => w.code == 'warningMwan4MarkMaskCollision');
+let collision_info = collision_warnings?.[0]?.info || '';
+let table_collision_warnings = filter(warnings,
+	w => w.code == 'warningMwan4TableCollision');
+let priority_collision_warnings = filter(warnings,
+	w => w.code == 'warningMwan4PriorityCollision');
+let priority_collision_info = priority_collision_warnings?.[0]?.info || '';
+let direct_rules = filter(lines,
+	l => index(l, 'add rule') == 0 &&
+		index(l, 'mwan4_iface_in_wan') >= 0 &&
+		index(l, 'Unsafe direct mwan4 interface') >= 0);
+let direct_label_rules = filter(lines,
+	l => index(l, 'add rule') == 0 &&
+		index(l, 'mwan4_iface_in_wan') >= 0 &&
+		index(l, 'Unsafe direct mwan4 label') >= 0);
+let strategy_rules = filter(lines,
+	l => index(l, 'add rule') == 0 &&
+		index(l, 'goto mwan4_strategy_balanced_ipv4') >= 0 &&
+		index(l, 'Safe mwan4 strategy') >= 0);
+let unknown_strategy_rules = filter(lines,
+	l => index(l, 'add rule') == 0 &&
+		index(l, 'Unknown mwan4 strategy') >= 0);
+
+let checks = [
+	['result_not_null',             result != null],
+	['direct_interface_rejected',   length(direct_errors) == 2],
+	['unknown_strategy_rejected',   length(unknown_strategy_errors) == 1],
+	['no_direct_iface_goto',        length(direct_rules) == 0],
+	['no_direct_label_goto',        length(direct_label_rules) == 0],
+	['no_unknown_strategy_rule',    length(unknown_strategy_rules) == 0],
+	['strategy_still_accepted',     length(strategy_rules) == 1],
+	['mark_collision_warned_once',  length(collision_warnings) == 1],
+	['mark_collision_lists_ifaces', index(collision_info, 'wan:') >= 0 &&
+		index(collision_info, 'wan6:') >= 0 &&
+		index(collision_info, 'mask 0x00000f00') >= 0],
+	['table_collision_warned',      length(table_collision_warnings) == 1],
+	['priority_collision_warned',   length(priority_collision_warnings) == 1 &&
+		index(priority_collision_info, 'vpn') >= 0],
+	['direct_targets_hidden',       index(interfaces, 'wan') < 0 &&
+		index(interfaces, 'wan6') < 0],
+	['hidden_direct_labeled',       labels['wan'] == 'mwan4:wan'],
+	['strategy_target_visible',     index(interfaces, 'mwan4_strategy_balanced') >= 0],
+	['uplinks_keep_real_ifaces',    index(uplink_interfaces, 'wan') >= 0 &&
+		index(uplink_interfaces, 'wan6') >= 0],
+];
+
+let pass = 0, fail = 0;
+for (let c in checks) {
+	if (c[1]) {
+		pass++;
+	} else {
+		fail++;
+		printf("FAIL: %s\n", c[0]);
+	}
+}
+printf("policy_mwan4_direct_rejected: %d/%d passed\n", pass, pass + fail);
+-- End --
+
+-- Expect stdout --
+policy_mwan4_direct_rejected: 15/15 passed
+-- End --

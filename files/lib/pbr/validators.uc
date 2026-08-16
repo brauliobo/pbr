@@ -48,6 +48,7 @@ function is_phys_dev(s) {
 function is_url_file(s) { return !!s && substr('' + s, 0, 7) == 'file://'; }
 function is_url_https(s) { return !!s && substr('' + s, 0, 8) == 'https://'; }
 function is_url(s) { if (!s) return false; s = '' + s; return is_url_file(s) || substr(s, 0, 6) == 'ftp://' || substr(s, 0, 7) == 'http://' || is_url_https(s); }
+function is_mwan4_strategy_target(s) { return !!s && !!match('' + s, /^mwan4_strategy_[A-Za-z0-9_][A-Za-z0-9_-]*$/); }
 
 function is_family_mismatch(a, b) {
 	a = replace('' + (a || ''), '!', '');
@@ -101,6 +102,7 @@ return {
 	is_url_file,
 	is_url_https,
 	is_url,
+	is_mwan4_strategy_target,
 	is_family_mismatch,
 	filter_options,
 	inline_set,

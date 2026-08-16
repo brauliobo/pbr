@@ -9,6 +9,25 @@ true
 {"type":"file"}
 -- End --
 
+-- File mwan4/config.json --
+{
+	"interfaces": ["wan", "wan6"],
+	"marks": {
+		"wan":  "0x00000100/0x00003f00",
+		"wan6": "0x00000200/0x00003f00"
+	},
+	"interface_chains": {
+		"wan":  "mwan4_iface_in_wan",
+		"wan6": "mwan4_iface_in_wan6"
+	},
+	"strategies": ["balanced", "failover"],
+	"strategy_chains": {
+		"balanced": "mwan4_strategy_balanced",
+		"failover": "mwan4_strategy_failover"
+	}
+}
+-- End --
+
 -- File uci/network.json --
 {
 	"interface": [
@@ -93,6 +112,42 @@ true
 			"dest_port": "",
 			"proto": "",
 			"chain": "prerouting"
+		},
+		{
+			".name": "policy_strategy_alias",
+			"name": "Route alias via mwan4 strategy",
+			"enabled": "1",
+			"interface": "mwan4:strategy:balanced",
+			"src_addr": "198.51.100.0/24",
+			"dest_addr": "",
+			"src_port": "",
+			"dest_port": "",
+			"proto": "",
+			"chain": "prerouting"
+		},
+		{
+			".name": "policy_strategy_domain",
+			"name": "Route domain via mwan4 strategy",
+			"enabled": "1",
+			"interface": "mwan4_strategy_balanced",
+			"src_addr": "",
+			"dest_addr": "example.com",
+			"src_port": "",
+			"dest_port": "",
+			"proto": "",
+			"chain": "prerouting"
+		},
+		{
+			".name": "policy_strategy_ports",
+			"name": "Route ports via mwan4 strategy",
+			"enabled": "1",
+			"interface": "mwan4:strategy:balanced",
+			"src_addr": "192.168.6.5",
+			"dest_addr": "",
+			"src_port": "443",
+			"dest_port": "80 443",
+			"proto": "",
+			"chain": "prerouting"
 		}
 	],
 	"dns_policy": [],
@@ -107,9 +162,12 @@ let pbr = create_pbr();
 let result = pbr.start_service(['on_start']);
 let nft_content = global.mocklib.read_captured('/var/run/pbr.nft') || '';
 let errors = result?.errors || [];
+let warnings = result?.warnings || [];
 
 let unknown_fwmark_errors = filter(errors,
 	e => e.code == 'errorPolicyProcessUnknownFwmark');
+let collision_warnings = filter(warnings,
+	w => w.code == 'warningMwan4MarkMaskCollision');
 
 let lines = split(nft_content, '\n');
 let strategy_rules = filter(lines,
@@ -117,6 +175,15 @@ let strategy_rules = filter(lines,
 
 let v4_rules = filter(strategy_rules, l => index(l, 'goto mwan4_strategy_balanced_ipv4') >= 0);
 let v6_rules = filter(strategy_rules, l => index(l, 'goto mwan4_strategy_balanced_ipv6') >= 0);
+let alias_rules = filter(strategy_rules, l => index(l, 'Route alias via mwan4 strategy') >= 0);
+let domain_rules = filter(strategy_rules,
+	l => index(l, 'Route domain via mwan4 strategy') >= 0 &&
+		index(l, '@pbr_mwan4_strategy_balanced_4_dst_ip_policy_strategy_domain') >= 0);
+let port_rules = filter(strategy_rules,
+	l => index(l, 'Route ports via mwan4 strategy') >= 0 &&
+		index(l, 'sport { 443 }') >= 0 &&
+		index(l, 'dport { 80, 443 }') >= 0);
+let dnsmasq_content = global.mocklib.read_captured('/var/run/pbr.dnsmasq') || '';
 
 // Snippet should also declare the strategy chain alias via `define`
 let define_lines = filter(lines, l => index(l, 'define pbr_mwan4_strategy_balanced_chain') == 0);
@@ -124,15 +191,26 @@ let define_lines = filter(lines, l => index(l, 'define pbr_mwan4_strategy_balanc
 let strategy_in_gateways = filter(result?.gateways || [],
 	g => index(g.name || '', 'mwan4_strategy_') == 0);
 
-let labels = result?.interface_labels || {};
-let wan_gw = filter(result?.gateways || [], g => g.name == 'wan')?.[0];
+let labels                = result?.interface_labels || {};
+let interfaces            = result?.interfaces || [];
+let uplink_interfaces     = result?.uplink_interfaces || [];
+let wan_gw                = filter(result?.gateways || [], g => g.name == 'wan')?.[0];
+let supported             = pbr.get_supported_interfaces('pbr')?.pbr || {};
+let rpc_interfaces        = supported.interfaces || [];
+let rpc_labels            = supported.interface_labels || {};
+let rpc_uplink_interfaces = supported.uplink_interfaces || [];
 
 let checks = [
 	['result_not_null',          result != null],
 	['no_unknown_fwmark',        length(unknown_fwmark_errors) == 0],
+	['default_mask_disjoint',    length(collision_warnings) == 0],
 	['has_strategy_rule',        length(strategy_rules) >= 2],
 	['ipv4_goto_strategy',       length(v4_rules) >= 1],
 	['ipv6_goto_strategy',       length(v6_rules) >= 1],
+	['label_alias_accepted',     length(alias_rules) == 1],
+	['domain_strategy_rule',     length(domain_rules) >= 1],
+	['domain_dnsmasq_set',       index(dnsmasq_content, 'nftset=/example.com/4#inet#fw4#pbr_mwan4_strategy_balanced_4_dst_ip_policy_strategy_domain') >= 0],
+	['source_port_strategy_rule', length(port_rules) >= 2],
 	['nft_defines_strategy',     length(define_lines) >= 1],
 	['strategy_not_in_gateways', length(strategy_in_gateways) == 0],
 	// Labeling: strategy has the mwan4:strategy: prefix in the dropdown map
@@ -142,10 +220,22 @@ let checks = [
 		labels['mwan4_strategy_failover'] == 'mwan4:strategy:failover'],
 	// 'ignore' has a self-label (no prefix)
 	['ignore_self_labeled',      labels['ignore'] == 'ignore'],
-	// Plain WAN (not netifd or mwan4 managed in this test) → label == name
-	['wan_self_labeled',         labels['wan'] == 'wan'],
+	// Direct mwan4 interfaces are labeled but hidden from policy choices
+	['wan_mwan4_labeled',        labels['wan'] == 'mwan4:wan'],
 	// gateways[] entries carry a label field
-	['wan_gateway_has_label',    wan_gw?.label == 'wan'],
+	['wan_gateway_has_label',    wan_gw?.label == 'mwan4:wan'],
+	// Round-trip API values stay canonical; labels carry the user-facing alias.
+	['strategy_canonical_value', index(interfaces, 'mwan4_strategy_balanced') >= 0],
+	['strategy_alias_not_value', index(interfaces, 'mwan4:strategy:balanced') < 0],
+	['uplinks_are_real_ifaces',  index(uplink_interfaces, 'wan') >= 0 &&
+		index(uplink_interfaces, 'wan6') >= 0 &&
+		index(uplink_interfaces, 'mwan4_strategy_balanced') < 0],
+	['rpc_strategy_canonical',   index(rpc_interfaces, 'mwan4_strategy_balanced') >= 0],
+	['rpc_strategy_label_alias', rpc_labels['mwan4_strategy_balanced'] == 'mwan4:strategy:balanced'],
+	['rpc_alias_not_value',      index(rpc_interfaces, 'mwan4:strategy:balanced') < 0],
+	['rpc_uplinks_real_ifaces',  index(rpc_uplink_interfaces, 'wan') >= 0 &&
+		index(rpc_uplink_interfaces, 'wan6') >= 0 &&
+		index(rpc_uplink_interfaces, 'mwan4_strategy_balanced') < 0],
 ];
 
 let pass = 0, fail = 0;
@@ -161,5 +251,5 @@ printf("policy_mwan4_strategy: %d/%d passed\n", pass, pass + fail);
 -- End --
 
 -- Expect stdout --
-policy_mwan4_strategy: 12/12 passed
+policy_mwan4_strategy: 24/24 passed
 -- End --

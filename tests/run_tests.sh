@@ -276,6 +276,12 @@ n_tests=0
 n_fails=0
 
 select_tests="$@"
+has_ucode=1
+
+if ! command -v ucode >/dev/null 2>&1; then
+	has_ucode=0
+	printf "\n##\n## Skipping ucode tests (ucode not found)\n##\n\n"
+fi
 
 use_test() {
 	local input="$(readlink -f "$1")"
@@ -293,18 +299,20 @@ use_test() {
 	return 1
 }
 
-for catdir in tests/[0-9][0-9]_*; do
-	[ -d "$catdir" ] || continue
+if [ "$has_ucode" -eq 1 ]; then
+	for catdir in tests/[0-9][0-9]_*; do
+		[ -d "$catdir" ] || continue
 
-	printf "\n##\n## Running %s tests\n##\n\n" "${catdir##*/[0-9][0-9]_}"
+		printf "\n##\n## Running %s tests\n##\n\n" "${catdir##*/[0-9][0-9]_}"
 
-	for testfile in "$catdir/"[0-9][0-9]_*; do
-		use_test "$testfile" || continue
+		for testfile in "$catdir/"[0-9][0-9]_*; do
+			use_test "$testfile" || continue
 
-		n_tests=$((n_tests + 1))
-		run_test "$testfile" || n_fails=$((n_fails + 1))
+			n_tests=$((n_tests + 1))
+			run_test "$testfile" || n_fails=$((n_fails + 1))
+		done
 	done
-done
+fi
 
 # ── Shell script syntax checks ──────────────────────────────────────
 

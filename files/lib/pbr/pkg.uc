@@ -65,6 +65,7 @@ function get_text(code, cfg, ...args) {
 		errorPolicyNoDns:                      sprintf("Policy '%s' has no assigned DNS", a1),
 		errorPolicyProcessNoInterfaceDns:      sprintf("Interface '%s' has no assigned DNS", a1),
 		errorPolicyUnknownInterface:           sprintf("Policy '%s' has an unknown interface", a1),
+		errorPolicyMwan4InterfaceTarget:       sprintf("Use a mwan4 strategy target for mwan4 interface '%s'", a1),
 		errorPolicyProcessCMD:                 sprintf("'%s'", a1),
 		errorFailedSetup:                      sprintf("Failed to set up '%s'", a1),
 		errorFailedReload:                     sprintf("Failed to reload '%s'", a1),
@@ -118,6 +119,9 @@ function get_text(code, cfg, ...args) {
 		warningSummary:                        sprintf("Warnings encountered, please check %s", pkg.url('#warning-messages-details')),
 		warningIncompatibleDHCPOption6:        sprintf("Incompatible DHCP Option 6 for interface '%s'", a1),
 		warningNetifdMissingInterfaceLocal:    sprintf("Netifd setup: option netifd_interface_local is missing, assuming '%s'", a1),
+		warningMwan4MarkMaskCollision:         sprintf("mwan4 mark/mask settings overlap pbr mark/mask settings (%s)", a1),
+		warningMwan4TableCollision:            sprintf("mwan4 and pbr routing tables overlap (%s)", a1),
+		warningMwan4PriorityCollision:         sprintf("mwan4 and pbr ip rule priorities overlap (%s)", a1),
 		warningUplinkDown:                     "Uplink/WAN interface is still down, going back to boot mode",
 		warningDynamicRoutingMode:             sprintf("Running in dynamic routing tables mode. Consider installing netifd extensions ('pbr netifd install') or mwan4 for more efficient operation. See %s", pkg.url('#routing-tables-modes')),
 	};

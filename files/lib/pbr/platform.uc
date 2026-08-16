@@ -26,6 +26,8 @@ function create_platform(fs_mod, config, sh, pkg, V) {
 		ifaces_supported: '',
 		webui_interfaces: [],
 		webui_interface_labels: {},
+		uplink_interfaces: [],
+		uplink_interface_labels: {},
 		uplink_gw: '',
 		uplink_gw4: '',
 		uplink_gw6: '',

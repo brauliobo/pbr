@@ -158,8 +158,25 @@ function create_network(fs_mod, config, sh, pkg, platform, V) {
 	function is_netifd_interface(iface) {
 		return !!(iface && env.netifd_mark[iface]);
 	}
+	function is_mwan4_strategy_name(name) {
+		return !!name && !!match('' + name, /^[A-Za-z0-9_][A-Za-z0-9_-]*$/);
+	}
+	function normalize_policy_target(iface) {
+		if (!iface) return iface;
+		iface = trim('' + iface);
+		if (substr(iface, 0, length('mwan4:strategy:')) == 'mwan4:strategy:') {
+			let strategy = substr(iface, length('mwan4:strategy:'));
+			if (is_mwan4_strategy_name(strategy))
+				return 'mwan4_strategy_' + strategy;
+			return iface;
+		}
+		if (substr(iface, 0, length('mwan4:')) == 'mwan4:')
+			return substr(iface, length('mwan4:'));
+		return iface;
+	}
 	function is_mwan4_interface(iface) {
-		return !!(iface && env.mwan4_mark[iface]);
+		iface = normalize_policy_target(iface);
+		return !!(iface && (env.mwan4_mark[iface] || env.mwan4_interface_chain[iface]));
 	}
 	function is_netifd_interface_default(iface) {
 		if (!is_netifd_interface(iface)) return false;
@@ -171,7 +188,15 @@ function create_network(fs_mod, config, sh, pkg, platform, V) {
 		if (!proto) return false;
 		return !!env.protocols[lc(proto)];
 	}
-	function is_mwan4_strategy(iface) { return iface && index(iface, 'mwan4_strategy_') == 0; }
+	function mwan4_strategy_name(iface) {
+		iface = normalize_policy_target(iface);
+		if (!V.is_mwan4_strategy_target(iface)) return '';
+		return substr('' + iface, length('mwan4_strategy_'));
+	}
+	function is_mwan4_strategy(iface) {
+		let strategy = mwan4_strategy_name(iface);
+		return !!(strategy && env.mwan4_strategy_chain[strategy]);
+	}
 	function is_supported_interface(iface) {
 		if (!iface) return false;
 		if (is_lan(iface) || is_disabled_interface(iface)) return false;
@@ -180,6 +205,13 @@ function create_network(fs_mod, config, sh, pkg, platform, V) {
 		if (is_ignore_target(iface)) return true;
 		if (is_xray(iface)) return true;
 		return false;
+	}
+	function is_supported_policy_target(iface) {
+		if (!iface) return false;
+		iface = normalize_policy_target(iface);
+		if (V.is_mwan4_strategy_target(iface)) return is_mwan4_strategy(iface);
+		if (is_mwan4_interface(iface)) return false;
+		return is_supported_interface(iface);
 	}
 	function is_config_enabled(section_type) {
 		let result = false;
@@ -312,19 +344,28 @@ function create_network(fs_mod, config, sh, pkg, platform, V) {
 			let parts = [];
 			let webui_parts = [];
 			let webui_labels = {};
+			let uplink_parts = [];
+			let uplink_labels = {};
 			config.uci_ctx('network', true).foreach('network', 'interface', function(s) {
 				let iface = s['.name'];
 				if (is_supported_interface(iface)) {
 					push(parts, iface);
-					push(webui_parts, iface);
-					if (env.mwan4_mark[iface])         webui_labels[iface] = 'mwan4:' + iface;
-					else if (env.netifd_mark[iface])   webui_labels[iface] = 'netifd:' + iface;
-					else                                webui_labels[iface] = iface;
+					push(uplink_parts, iface);
+					if (is_mwan4_interface(iface)) {
+						webui_labels[iface] = 'mwan4:' + iface;
+						uplink_labels[iface] = 'mwan4:' + iface;
+					} else {
+						push(webui_parts, iface);
+						if (env.netifd_mark[iface]) webui_labels[iface] = 'netifd:' + iface;
+						else                      webui_labels[iface] = iface;
+						uplink_labels[iface] = webui_labels[iface];
+					}
 				}
 			});
 			// Add mwan4 strategies
 			for (let strategy in keys(env.mwan4_strategy_chain)) {
 				let value = 'mwan4_strategy_' + strategy;
+				if (!V.is_mwan4_strategy_target(value)) continue;
 				push(webui_parts, value);
 				webui_labels[value] = 'mwan4:strategy:' + strategy;
 			}
@@ -333,6 +374,8 @@ function create_network(fs_mod, config, sh, pkg, platform, V) {
 			env.ifaces_supported = join(' ', parts);
 			env.webui_interfaces = webui_parts;
 			env.webui_interface_labels = webui_labels;
+			env.uplink_interfaces = uplink_parts;
+			env.uplink_interface_labels = uplink_labels;
 		}
 
 		// Discover gateways
@@ -384,8 +427,9 @@ function create_network(fs_mod, config, sh, pkg, platform, V) {
 		is_ignored_interface, is_tor_running,
 		is_ignore_target, is_netifd_table, is_netifd_interface,
 		is_mwan4_interface, is_netifd_interface_default,
-		is_supported_protocol, is_mwan4_strategy,
-		is_supported_interface, is_config_enabled,
+		is_supported_protocol, normalize_policy_target, mwan4_strategy_name,
+		is_mwan4_strategy, is_supported_interface,
+		is_supported_policy_target, is_config_enabled,
 		get_gateway4, get_gateway6,
 		get_ipaddr4, get_ipaddr6,
 		load, is_wan_up,

@@ -140,6 +140,121 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 		output.okn();
 	};
 	
+	function _parse_mark_mask(value, fallback_mask) {
+		let parts = split('' + (value || ''), '/');
+		let mark_text = parts[0] || '';
+		let mask_text = parts[1] || '';
+		return {
+			mark_text: mark_text,
+			mask_text: mask_text,
+			mark: hex(mark_text),
+			mask: mask_text ? hex(mask_text) : (fallback_mask || 0),
+		};
+	}
+
+	function _is_mwan4_rule(line) {
+		if (index(line, 'mwan4') >= 0) return true;
+
+		let rule_mark = match(line, /fwmark\s+(\S+)/);
+		if (!rule_mark) return false;
+
+		let rule = _parse_mark_mask(rule_mark[1], 0);
+		for (let iface in keys(env.mwan4_mark)) {
+			let m4 = _parse_mark_mask(env.mwan4_mark[iface], 0);
+			if (rule.mark == m4.mark) return true;
+			if (rule.mask && m4.mask && rule.mask == m4.mask && (rule.mark & m4.mask) == (m4.mark & m4.mask))
+				return true;
+		}
+		return false;
+	}
+
+	function _check_mwan4_mark_mask_collisions() {
+		let pbr_mask = hex(cfg.fw_mask);
+		let pbr_mark = hex(cfg.uplink_mark);
+		if (!pbr_mask && !pbr_mark) return;
+
+		let collisions = [];
+		let seen = {};
+		for (let iface in keys(env.mwan4_mark)) {
+			let m4 = _parse_mark_mask(env.mwan4_mark[iface], 0);
+			let reasons = [];
+			if (m4.mark && (m4.mark & pbr_mask) != 0)
+				push(reasons, 'mark ' + m4.mark_text + ' intersects pbr fw_mask ' + cfg.fw_mask);
+			if (m4.mask && (m4.mask & pbr_mask) != 0)
+				push(reasons, 'mask ' + m4.mask_text + ' intersects pbr fw_mask ' + cfg.fw_mask);
+			if (m4.mask && (pbr_mark & m4.mask) != 0)
+				push(reasons, 'pbr uplink_mark ' + cfg.uplink_mark + ' intersects mwan4 mask ' + m4.mask_text);
+			if (!length(reasons)) continue;
+
+			let info = iface + ': ' + join('; ', reasons);
+			if (seen[info]) continue;
+			seen[info] = true;
+			push(collisions, info);
+		}
+
+		if (length(collisions) > 0)
+			push(state.warnings, { code: 'warningMwan4MarkMaskCollision', info: join(', ', collisions) });
+	}
+
+	function _check_mwan4_table_collisions() {
+		let rt = _fs.readfile(pkg.rt_tables_file) || '';
+		let tables = {};
+		for (let line in split(rt, '\n')) {
+			let m = match(line, /^\s*([0-9]+)\s+(\S+)/);
+			if (!m) continue;
+
+			let id = m[1];
+			let name = m[2];
+			if (!tables[id]) tables[id] = { pbr: [], mwan4: [] };
+			if (index(name, pkg.ip_table_prefix + '_') == 0)
+				push(tables[id].pbr, name);
+			if (index(name, 'mwan4') == 0 || index(name, '_mwan4') >= 0)
+				push(tables[id].mwan4, name);
+		}
+
+		let collisions = [];
+		for (let id in keys(tables)) {
+			let entry = tables[id];
+			if (length(entry.pbr) && length(entry.mwan4))
+				push(collisions, 'table ' + id + ': ' + join('/', entry.pbr) + ' vs ' + join('/', entry.mwan4));
+		}
+
+		if (length(collisions) > 0)
+			push(state.warnings, { code: 'warningMwan4TableCollision', info: join(', ', collisions) });
+	}
+
+	function _check_mwan4_priority_collisions() {
+		let pbr_priorities = {};
+		for (let name in keys(iface_registry)) {
+			let iface = iface_registry[name];
+			if (!iface?.priority || iface.action == 'mwan4_strategy') continue;
+			if (net.is_netifd_interface(name) || net.is_mwan4_interface(name)) continue;
+			pbr_priorities['' + iface.priority] = name;
+		}
+		if (!length(keys(pbr_priorities))) return;
+
+		let collisions = [];
+		for (let family in ['-4', '-6']) {
+			let out = sh.exec(pkg.ip_full + ' ' + family + ' rule list 2>/dev/null');
+			for (let line in split(out, '\n')) {
+				let m = match(line, /^\s*([0-9]+):/);
+				if (!m || !pbr_priorities[m[1]]) continue;
+				if (_is_mwan4_rule(line))
+					push(collisions, family + ' priority ' + m[1] + ' (' + pbr_priorities[m[1]] + '): ' + trim(line));
+			}
+		}
+
+		if (length(collisions) > 0)
+			push(state.warnings, { code: 'warningMwan4PriorityCollision', info: join(', ', collisions) });
+	}
+
+	function _check_mwan4_collision_diagnostics() {
+		if (!length(keys(env.mwan4_mark))) return;
+		_check_mwan4_mark_mask_collisions();
+		_check_mwan4_table_collisions();
+		_check_mwan4_priority_collisions();
+	}
+
 	function _check_system_health() {
 		let health_fail = false;
 		if (!env.nft_installed) {
@@ -386,10 +501,9 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 			dest4 = 'tproxy ' + pkg.nft_ipv4_flag + ' to :' + xport + ' accept';
 			dest6 = 'tproxy ' + pkg.nft_ipv6_flag + ' to :' + xport + ' accept';
 		} else if (net.is_mwan4_strategy(iface)) {
-			let strategy_data = get_interface(iface);
-			let sname = strategy_data?.strategy_name;
-			if (sname) {
-				let schain = env.mwan4_strategy_chain[sname] || (pkg.mwan4_nft_prefix + '_strategy_' + sname);
+			let sname = net.mwan4_strategy_name(iface);
+			let schain = sname ? env.mwan4_strategy_chain[sname] : '';
+			if (schain) {
 				dest4 = 'goto ' + schain + '_ipv4';
 				dest6 = 'goto ' + schain + '_ipv6';
 			} else {
@@ -624,8 +738,12 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 			push(state.errors, { code: 'errorPolicyNoInterface', info: name });
 			output.fail(); return 1;
 		}
-		if (!net.is_supported_interface(interface_name) && !net.is_mwan4_strategy(interface_name)) {
-			push(state.errors, { code: 'errorPolicyUnknownInterface', info: name });
+		interface_name = net.normalize_policy_target(interface_name);
+		if (!net.is_supported_policy_target(interface_name)) {
+			if (net.is_mwan4_interface(interface_name))
+				push(state.errors, { code: 'errorPolicyMwan4InterfaceTarget', info: interface_name });
+			else
+				push(state.errors, { code: 'errorPolicyUnknownInterface', info: name });
 			output.fail(); return 1;
 		}
 	
@@ -991,7 +1109,10 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 	// makes status/gateway summaries skip these entries.
 	function strategy_enumerate() {
 		for (let sname in keys(env.mwan4_strategy_chain)) {
-			set_interface('mwan4_strategy_' + sname, {
+			let target = 'mwan4_strategy_' + sname;
+			if (!V.is_mwan4_strategy_target(target)) continue;
+
+			set_interface(target, {
 				action: 'mwan4_strategy',
 				strategy_name: sname,
 				chain_name: env.mwan4_strategy_chain[sname],
@@ -1734,6 +1855,7 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 		start_time = time();
 		interface_enumerate();
 		strategy_enumerate();
+		_check_mwan4_collision_diagnostics();
 		end_time = time();
 		output.logger_debug(cfg.debug_performance, '[PERF-DEBUG] Enumerating interfaces took ' + (end_time - start_time) + 's');
 
@@ -1886,8 +2008,8 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 		let _interface_label = function(name, iface) {
 			if (iface?.action == 'mwan4_strategy')
 				return 'mwan4:strategy:' + (iface.strategy_name || name);
-			if (env.mwan4_mark[name])  return 'mwan4:' + name;
-			if (env.netifd_mark[name]) return 'netifd:' + name;
+			if (net.is_mwan4_interface(name)) return 'mwan4:' + name;
+			if (env.netifd_mark[name])        return 'netifd:' + name;
 			return name;
 		};
 		let _build_gateway_summary = function() {
@@ -1931,6 +2053,8 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 			warnings: state.warnings,
 			interfaces: env.webui_interfaces,
 			interface_labels: env.webui_interface_labels,
+			uplink_interfaces: env.uplink_interfaces,
+			uplink_interface_labels: env.uplink_interface_labels,
 			platform: {
 				nft_installed: env.nft_installed,
 				adguardhome_installed: env.adguardhome_installed,
@@ -2339,6 +2463,8 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 			warnings: svc_data?.warnings || [],
 			interfaces: env.webui_interfaces,
 			interface_labels: env.webui_interface_labels,
+			uplink_interfaces: env.uplink_interfaces,
+			uplink_interface_labels: env.uplink_interface_labels,
 			protocols: sort(keys(env.protocols)),
 			platform: {
 				nft_installed: env.nft_installed,
@@ -2372,6 +2498,8 @@ function create_pbr(fs_mod, uci_mod, ubus_mod) {
 		result[name] = {
 			interfaces: env.webui_interfaces,
 			interface_labels: env.webui_interface_labels,
+			uplink_interfaces: env.uplink_interfaces,
+			uplink_interface_labels: env.uplink_interface_labels,
 		};
 		return result;
 	}
